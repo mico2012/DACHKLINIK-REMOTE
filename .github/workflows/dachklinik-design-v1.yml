@@ -1,0 +1,251 @@
+# DACHKLINIK: RustDesk 1.5.3 with DESIGN V1.0 home screen patch, Windows x64 only.
+# This file is installed on the default/master branch for workflow_dispatch.
+# Build uses DACHKLINIK development branch at its reviewed DESIGN V1.0 commit, not master.
+# No automatic push trigger, code signing, releases, or deployment.
+name: DACHKLINIK - DESIGN V1.0 Windows x64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dachklinik-rustdesk-x64-design-v1
+  cancel-in-progress: false
+
+jobs:
+  bridge:
+    name: Generate Flutter-Rust bridge (required for Windows)
+    runs-on: ubuntu-22.04
+    env:
+      RUST_VERSION: '1.75'
+      CARGO_EXPAND_VERSION: '1.0.95'
+      FLUTTER_RUST_BRIDGE_VERSION: '1.80.1'
+    steps:
+      - name: Check out DACHKLINIK DESIGN V1.0 with submodules
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: dachklinik-v1.5.3
+          fetch-depth: 2
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Verify DACHKLINIK design revision
+        shell: bash
+        run: |
+          revision="$(git rev-parse HEAD)"
+          [[ "$revision" == 9a24afc* ]] || { echo "Unexpected revision: $revision"; exit 1; }
+          test "$(git rev-parse HEAD^)" = '95cca3f661f635b3cc85c04935fe8d96d8f432ef' || { echo 'Base commit mismatch'; exit 1; }
+          test "$(git diff --name-only HEAD^ HEAD)" = 'flutter/lib/desktop/pages/desktop_home_page.dart' || { echo 'Unexpected changed files'; exit 1; }
+          python3 - <<'PY_CHECK_UI'
+          from pathlib import Path
+          s = Path('flutter/lib/desktop/pages/desktop_home_page.dart').read_text(encoding='utf-8')
+          start = s.index('final children = <Widget>[')
+          end = s.index('if (isIncomingOnly) {', start)
+          ui = s[start:end]
+          assert "'DACHKLINIK REMOTE'" in ui
+          assert 'buildIDBoard(context)' in ui
+          assert 'buildPasswordBoard(context)' not in ui
+          assert 'buildHelpCards(' not in ui
+          print('DESIGN V1.0 checked: only home UI modified; password authentication remains in core.')
+          PY_CHECK_UI
+
+      - name: Install bridge prerequisites
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates clang cmake curl gcc git g++ libclang-dev libgtk-3-dev llvm-dev nasm ninja-build pkg-config wget
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: '1.75'
+          targets: x86_64-unknown-linux-gnu
+          components: rustfmt
+
+      - name: Install Flutter for bridge codegen
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: stable
+          flutter-version: '3.22.3'
+          cache: true
+
+      - name: Install bridge generators and resolve Dart dependencies
+        shell: bash
+        run: |
+          cargo install cargo-expand --version "$CARGO_EXPAND_VERSION" --locked
+          cargo install flutter_rust_bridge_codegen --version "$FLUTTER_RUST_BRIDGE_VERSION" --features uuid --locked
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+          (cd flutter && flutter pub get)
+
+      - name: Generate bridge
+        shell: bash
+        run: |
+          "$HOME/.cargo/bin/flutter_rust_bridge_codegen" --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
+          cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+
+      - name: Upload bridge for the Windows job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bridge-artifact
+          path: |
+            ./src/bridge_generated.rs
+            ./src/bridge_generated.io.rs
+            ./flutter/lib/generated_bridge.dart
+            ./flutter/lib/generated_bridge.freezed.dart
+            ./flutter/macos/Runner/bridge_generated.h
+            ./flutter/ios/Runner/bridge_generated.h
+          if-no-files-found: error
+          retention-days: 7
+
+  topmost:
+    name: Build Windows helper DLL (x64 only)
+    uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
+    with:
+      upload-artifact: true
+      target: windows-2022
+      configuration: Release
+      platform: x64
+      target_version: Windows10
+
+  windows-x64:
+    name: DACHKLINIK DESIGN Windows x64 (unsigned test)
+    needs: [bridge, topmost]
+    runs-on: windows-2022
+    timeout-minutes: 360
+    env:
+      FLUTTER_VERSION: '3.24.5'
+      LLVM_VERSION: '15.0.6'
+      VCPKG_COMMIT_ID: '9e593bb18ea69cc5095e012465dcd675a822ed0d'
+      VCPKG_BINARY_SOURCES: 'clear;x-gha,readwrite'
+    steps:
+      - name: Initialize GitHub Actions cache environment
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Check out DACHKLINIK DESIGN V1.0 with submodules
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: dachklinik-v1.5.3
+          fetch-depth: 2
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Verify DACHKLINIK design revision
+        shell: pwsh
+        run: |
+          $revision = (git rev-parse HEAD).Trim()
+          if (-not $revision.StartsWith('9a24afc')) { throw "Wrong design revision: $revision" }
+          $base = (git rev-parse 'HEAD^').Trim()
+          if ($base -ne '95cca3f661f635b3cc85c04935fe8d96d8f432ef') { throw 'Unexpected base commit' }
+          $changed = @(git diff --name-only 'HEAD^' HEAD)
+          if ($changed.Count -ne 1 -or $changed[0] -ne 'flutter/lib/desktop/pages/desktop_home_page.dart') { throw 'Unexpected modified file(s)' }
+          $source = Get-Content -LiteralPath './flutter/lib/desktop/pages/desktop_home_page.dart' -Raw -Encoding UTF8
+          if (-not $source.Contains("'DACHKLINIK REMOTE'")) { throw 'DACHKLINIK design marker missing' }
+
+      - name: Download generated bridge
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
+        with:
+          version: '15.0.6'
+
+      - name: Install Flutter 3.24.5
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225 # v2.12.0
+        with:
+          channel: stable
+          flutter-version: '3.24.5'
+          architecture: x64
+
+      - name: Install RustDesk custom Flutter Windows engine
+        shell: pwsh
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri 'https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip' -OutFile 'windows-x64-release.zip'
+          Expand-Archive -Path 'windows-x64-release.zip' -DestinationPath 'windows-x64-release'
+          Move-Item -Force -Path 'windows-x64-release/*' -Destination 'C:/hostedtoolcache/windows/flutter/stable-3.24.5-x64/bin/cache/artifacts/engine/windows-x64-release/'
+
+      - name: Apply upstream Flutter dropdown compatibility patch
+        shell: bash
+        run: |
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff "$(dirname "$(dirname "$(which flutter)")")"
+          cd "$(dirname "$(dirname "$(which flutter)")")"
+          git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Install Rust 1.75 toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: '1.75'
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt
+
+      - name: Cache Rust compilation
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: windows-2022
+
+      - name: Set up vcpkg with GitHub Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: 9e593bb18ea69cc5095e012465dcd675a822ed0d
+          doNotCache: false
+
+      - name: Install native dependencies for x64
+        shell: bash
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        run: |
+          if ! "$VCPKG_ROOT/vcpkg" install --triplet x64-windows-static --x-install-root="$VCPKG_ROOT/installed"; then
+            find "$VCPKG_ROOT/" -name '*.log' -print | head -n 30
+            exit 1
+          fi
+
+      - name: Build RustDesk Flutter x64 (portable folder, not installer)
+        shell: pwsh
+        run: |
+          python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec --vram
+          if ($LASTEXITCODE -ne 0) { throw "RustDesk build failed: $LASTEXITCODE" }
+          $release = 'flutter/build/windows/x64/runner/Release'
+          if (-not (Test-Path -LiteralPath "$release/rustdesk.exe")) { throw "Missing: $release/rustdesk.exe" }
+          Move-Item -LiteralPath $release -Destination 'rustdesk'
+
+      - name: Include RustDesk Windows helper DLL
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: topmostwindow-artifacts-x64
+          path: ./rustdesk
+
+      - name: Check design outputs and write checksums
+        shell: pwsh
+        run: |
+          if (-not (Test-Path './rustdesk/rustdesk.exe')) { throw 'rustdesk.exe not found' }
+          if (-not (Test-Path './rustdesk/flutter_windows.dll')) { throw 'Flutter Windows runtime not found' }
+          (Get-FileHash './rustdesk/rustdesk.exe' -Algorithm SHA256).Hash | Set-Content './rustdesk/EXE_SHA256.txt'
+          Copy-Item -LiteralPath './LICENCE' -Destination './rustdesk/LICENCE'
+          @'
+          DACHKLINIK REMOTE DESIGN V1.0 — WINDOWS X64 TEST BUILD
+          Based on RustDesk 1.5.3 with UI-only home screen change.
+          One-time password UI panel hidden; authentication mechanism unchanged.
+          The executable is unsigned and runs from this complete directory.
+          Do not move only rustdesk.exe without its DLLs/assets.
+          No GitHub Release is published by this workflow.
+          Source revision: DACHKLINIK development branch, DESIGN V1.0 commit 9a24afc
+          '@ | Set-Content './rustdesk/DESIGN_README.txt'
+
+      - name: Upload DACHKLINIK DESIGN V1.0 Windows x64 (ZIP)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: DACHKLINIK-REMOTE-DESIGN-V1.0-WINDOWS-X64
+          path: ./rustdesk/
+          if-no-files-found: error
+          retention-days: 7
