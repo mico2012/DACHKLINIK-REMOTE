@@ -79,7 +79,6 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     final isIncomingOnly = bind.isIncomingOnly();
     final isOutgoingOnly = bind.isOutgoingOnly();
     final children = <Widget>[
-      if (!isOutgoingOnly) buildPresetPasswordWarning(),
       if (bind.isCustomClient())
         Align(
           alignment: Alignment.center,
@@ -89,27 +88,28 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         alignment: Alignment.center,
         child: loadLogo(),
       ),
-      buildTip(context),
-      if (!isOutgoingOnly) buildIDBoard(context),
-      if (!isOutgoingOnly) buildPasswordBoard(context),
-      FutureBuilder<Widget>(
-        future: Future.value(
-            Obx(() => buildHelpCards(stateGlobal.updateUrl.value))),
-        builder: (_, data) {
-          if (data.hasData) {
-            if (isIncomingOnly) {
-              if (isInHomePage()) {
-                Future.delayed(Duration(milliseconds: 300), () {
-                  _updateWindowSize();
-                });
-              }
-            }
-            return data.data!;
-          } else {
-            return const Offstage();
-          }
-        },
+      const Padding(
+        padding: EdgeInsets.fromLTRB(20, 16, 16, 14),
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: Text(
+            'DACHKLINIK REMOTE',
+            style: TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
       ),
+      if (!isOutgoingOnly) buildIDBoard(context),
+      if (systemError.isNotEmpty)
+        Padding(
+          padding: const EdgeInsets.all(12),
+          child: Text(
+            systemError,
+            style: const TextStyle(color: Colors.red),
+          ),
+        ),
     ];
     if (isIncomingOnly) {
       children.addAll([
