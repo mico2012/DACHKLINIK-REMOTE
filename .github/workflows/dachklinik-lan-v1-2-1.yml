@@ -1,0 +1,1090 @@
+# DACHKLINIK REMOTE V1.2.1 AUTOMATIC LAN AND APPROVAL, Windows x64 portable pilot.
+# Install alongside the V1.1 workflow on the default branch and run manually.
+# No push trigger, installer build, code signing, release, or deployment.
+name: DACHKLINIK REMOTE V1.2.1 - AUTOMATIC LAN AND CLICK APPROVAL
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dachklinik-rustdesk-x64-lan-v121
+  cancel-in-progress: false
+
+jobs:
+  bridge:
+    name: Generate Flutter-Rust bridge (required for Windows)
+    runs-on: ubuntu-22.04
+    env:
+      RUST_VERSION: '1.75'
+      CARGO_EXPAND_VERSION: '1.0.95'
+      FLUTTER_RUST_BRIDGE_VERSION: '1.80.1'
+    steps:
+      - name: Check out DACHKLINIK DESIGN V1.0 with submodules
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: dachklinik-v1.5.3
+          fetch-depth: 2
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Verify DACHKLINIK design revision
+        shell: bash
+        run: |
+          revision="$(git rev-parse HEAD)"
+          [[ "$revision" == 9a24afc* ]] || { echo "Unexpected revision: $revision"; exit 1; }
+          test "$(git rev-parse HEAD^)" = '95cca3f661f635b3cc85c04935fe8d96d8f432ef' || { echo 'Base commit mismatch'; exit 1; }
+          test "$(git diff --name-only HEAD^ HEAD)" = 'flutter/lib/desktop/pages/desktop_home_page.dart' || { echo 'Unexpected changed files'; exit 1; }
+          python3 - <<'PY_CHECK_UI'
+          from pathlib import Path
+          s = Path('flutter/lib/desktop/pages/desktop_home_page.dart').read_text(encoding='utf-8')
+          start = s.index('final children = <Widget>[')
+          end = s.index('if (isIncomingOnly) {', start)
+          ui = s[start:end]
+          assert "'DACHKLINIK REMOTE'" in ui
+          assert 'buildIDBoard(context)' in ui
+          assert 'buildPasswordBoard(context)' not in ui
+          assert 'buildHelpCards(' not in ui
+          print('DESIGN V1.0 checked: only home UI modified; password authentication remains in core.')
+          PY_CHECK_UI
+
+      - name: Stage the versioned LAN discovery module
+        shell: bash
+        run: |
+          cat > _DACHKLINIK_DISCOVERY_INPUT.rs <<'DACHKLINIK_DISCOVERY_RS'
+          // Local discovery for DACHKLINIK REMOTE. No external dependencies in this module.
+          use std::{
+              collections::{BTreeMap, BTreeSet},
+              io::{self, ErrorKind},
+              net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
+              sync::atomic::{AtomicBool, Ordering},
+              thread,
+              time::{Duration, Instant},
+          };
+
+          pub const SESSION_PORT: u16 = 21138;
+          const DISCOVERY_PORT: u16 = 21139;
+          const QUERY: &[u8] = b"DACHKLINIK-V12-DISCOVER\0";
+          const REPLY: &[u8] = b"DACHKLINIK-V12-HOST\0";
+          const NAME_MAX: usize = 96;
+          const MAX_PEERS: usize = 64;
+          const SCAN_TIME: Duration = Duration::from_millis(700);
+          static ACCEPTING: AtomicBool = AtomicBool::new(false);
+
+          pub fn set_accepting(value: bool) {
+              ACCEPTING.store(value, Ordering::Relaxed);
+          }
+
+          #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+          pub struct Network {
+              local: Ipv4Addr,
+              mask: u32,
+          }
+
+          impl Network {
+              pub fn new(local: Ipv4Addr, netmask: Ipv4Addr) -> Option<Self> {
+                  let mask = u32::from(netmask);
+                  let prefix = mask.leading_ones();
+                  if !local.is_private() || prefix == 0 || prefix > 30 || mask != u32::MAX << (32 - prefix) {
+                      return None;
+                  }
+                  Some(Self { local, mask })
+              }
+
+              fn broadcast(self) -> Ipv4Addr {
+                  Ipv4Addr::from(u32::from(self.local) | !self.mask)
+              }
+
+              fn admits(self, ip: Ipv4Addr) -> bool {
+                  let address = u32::from(ip);
+                  let network = u32::from(self.local) & self.mask;
+                  ip.is_private()
+                      && address & self.mask == network
+                      && address != network
+                      && ip != self.broadcast()
+              }
+          }
+
+          pub fn other_lan_pc(networks: &[Network], ip: Ipv4Addr) -> bool {
+              !networks.iter().any(|net| net.local == ip) && networks.iter().any(|net| net.admits(ip))
+          }
+
+          fn named_packet(nonce: &[u8], name: &str) -> Vec<u8> {
+              let end = name
+                  .char_indices()
+                  .map(|(i, ch)| i + ch.len_utf8())
+                  .take_while(|&i| i <= NAME_MAX)
+                  .last()
+                  .unwrap_or(0);
+              let mut data = REPLY.to_vec();
+              data.extend_from_slice(nonce);
+              data.extend_from_slice(&name.as_bytes()[..end]);
+              data
+          }
+
+          fn extract_name(packet: &[u8], nonce: &[u8; 16]) -> Option<String> {
+              let body = packet.strip_prefix(REPLY)?.strip_prefix(nonce.as_slice())?;
+              if body.is_empty() || body.len() > NAME_MAX {
+                  return None;
+              }
+              let name = std::str::from_utf8(body).ok()?.trim();
+              if name.is_empty() || name.chars().any(|c| c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')) {
+                  return None;
+              }
+              Some(name.to_owned())
+          }
+
+          pub fn listen(hostname: &str, networks: impl Fn() -> Vec<Network>, stopped: impl Fn() -> bool) -> io::Result<()> {
+              let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT))?;
+              let mut buf = [0u8; 256];
+              // Cache interface enumeration and the last reply time to bound work on bursts.
+              let mut interfaces = Vec::new();
+              let mut refreshed: Option<Instant> = None;
+              let mut last_reply: Option<Instant> = None;
+              loop {
+                  let (size, source) = socket.recv_from(&mut buf)?;
+                  let SocketAddr::V4(source) = source else { continue };
+                  let Some(nonce) = buf[..size].strip_prefix(QUERY) else { continue };
+                  if nonce.len() != 16 || !ACCEPTING.load(Ordering::Relaxed) || stopped() {
+                      continue;
+                  }
+                  if last_reply.is_some_and(|t| t.elapsed() < Duration::from_millis(12)) {
+                      continue;
+                  }
+                  if refreshed.map_or(true, |t| t.elapsed() > Duration::from_secs(3)) {
+                      interfaces = networks();
+                      refreshed = Some(Instant::now());
+                  }
+                  if other_lan_pc(&interfaces, *source.ip()) {
+                      last_reply = Some(Instant::now());
+                      let _ = socket.send_to(&named_packet(nonce, hostname), source);
+                  }
+              }
+          }
+
+          pub fn scan(networks: &[Network], nonce: [u8; 16]) -> BTreeMap<Ipv4Addr, String> {
+              let mut query = QUERY.to_vec();
+              query.extend_from_slice(&nonce);
+              let mut sockets = Vec::new();
+              for net in networks.iter().copied().collect::<BTreeSet<_>>().into_iter().take(32) {
+                  let Ok(socket) = UdpSocket::bind((net.local, 0)) else { continue };
+                  if socket.set_broadcast(true).is_err() || socket.set_nonblocking(true).is_err() {
+                      continue;
+                  }
+                  let target = SocketAddrV4::new(net.broadcast(), DISCOVERY_PORT);
+                  if socket.send_to(&query, target).is_ok() {
+                      sockets.push((net, socket));
+                  }
+              }
+              let until = Instant::now() + SCAN_TIME;
+              let mut peers = BTreeMap::new();
+              let mut buf = [0u8; 256];
+              while !sockets.is_empty() && Instant::now() < until && peers.len() < MAX_PEERS {
+                  for (net, socket) in &sockets {
+                      for _ in 0..8 {
+                          match socket.recv_from(&mut buf) {
+                              Ok((size, SocketAddr::V4(source))) => {
+                                  let ip = *source.ip();
+                                  if source.port() == DISCOVERY_PORT && net.admits(ip) && other_lan_pc(networks, ip) {
+                                      if let Some(name) = extract_name(&buf[..size], &nonce) {
+                                          peers.entry(ip).or_insert(name);
+                                          if peers.len() >= MAX_PEERS { return peers; }
+                                      }
+                                  }
+                              }
+                              Ok(_) => {}
+                              Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                              Err(_) => break,
+                          }
+                      }
+                  }
+                  thread::sleep(Duration::from_millis(12));
+              }
+              peers
+          }
+
+          #[cfg(test)]
+          mod tests {
+              use super::*;
+
+              #[test]
+              fn same_subnet_and_no_self_or_broadcast() {
+                  let net = Network::new("192.168.5.20".parse().unwrap(), "255.255.254.0".parse().unwrap()).unwrap();
+                  let own = Network::new("192.168.4.30".parse().unwrap(), "255.255.254.0".parse().unwrap()).unwrap();
+                  let all = [net, own];
+                  assert_eq!(net.broadcast(), "192.168.5.255".parse::<Ipv4Addr>().unwrap());
+                  for allowed in ["192.168.5.21", "192.168.4.21"] {
+                      assert!(other_lan_pc(&all, allowed.parse().unwrap()));
+                  }
+                  for rejected in ["192.168.5.20", "192.168.4.30", "192.168.4.0", "192.168.5.255", "192.168.6.20", "8.8.8.8"] {
+                      assert!(!other_lan_pc(&all, rejected.parse().unwrap()));
+                  }
+                  assert!(Network::new("192.168.5.20".parse().unwrap(), "255.0.255.0".parse().unwrap()).is_none());
+                  assert!(Network::new("8.8.8.8".parse().unwrap(), "255.255.255.0".parse().unwrap()).is_none());
+              }
+
+              #[test]
+              fn response_must_echo_nonce_and_have_a_valid_bounded_name() {
+                  let nonce = [1; 16];
+                  assert_eq!(extract_name(&named_packet(&nonce, "AIDA-PC"), &nonce).as_deref(), Some("AIDA-PC"));
+                  assert!(extract_name(&named_packet(&nonce, "AIDA-PC"), &[2; 16]).is_none());
+                  assert!(extract_name(&named_packet(&nonce, "AIDA\nPC"), &nonce).is_none());
+                  assert!(extract_name(&named_packet(&nonce, "AIDA\u{202e}PC"), &nonce).is_none());
+                  assert!(extract_name(b"unrelated", &nonce).is_none());
+                  assert!(extract_name(&named_packet(&nonce, &"Ž".repeat(100)), &nonce).unwrap().len() <= NAME_MAX);
+              }
+          }
+          DACHKLINIK_DISCOVERY_RS
+
+      - name: Check and stage LAN source against the pinned RustDesk revision
+        shell: bash
+        run: |
+          python3 - <<'PY_DACHKLINIK_LAN'
+          # DACHKLINIK REMOTE V1.2 LAN pilot. Run on the pinned checkout before build.
+          import re
+          from pathlib import Path
+
+          changes = {}
+
+          def read(rel):
+              if rel not in changes:
+                  changes[rel] = Path(rel).read_text(encoding='utf-8')
+              return changes[rel]
+
+          def edit(rel, pattern, replacement):
+              source = read(rel)
+              matches = list(re.finditer(pattern, source, re.M))
+              if len(matches) != 1:
+                  raise SystemExit(f'LAN patch stopped: {rel}, expected 1 anchor, got {len(matches)}: {pattern}')
+              m = matches[0]
+              sub = replacement(m) if callable(replacement) else replacement
+              changes[rel] = source[:m.start()] + sub + source[m.end():]
+
+          def after(rel, anchor, body):
+              edit(rel, anchor, lambda m: m[0] + body)
+
+          mediator = 'src/rendezvous_mediator.rs'
+          client = 'src/client.rs'
+          common = 'src/common.rs'
+          connection = 'src/server/connection.rs'
+          ui = 'src/ui_interface.rs'
+          cfg = 'libs/hbb_common/src/config.rs'
+
+          # Distinct configuration and local IPC namespace from a stock RustDesk process.
+          edit(cfg, r'(pub static ref APP_NAME: RwLock<String> = RwLock::new\()"RustDesk"(\.to_owned\(\)\);)',
+               lambda m: m[1] + '"DachklinikRemoteV12"' + m[2])
+
+          # Reuse upstream listener, approved session code and Windows portable startup.
+          after(mediator, r'    pub async fn start_all\(\) \{', '''
+                  if cfg!(windows) {
+                      check_zombie();
+                      let server = new_server();
+                      if !config::is_outgoing_only() {
+                          let direct = server.clone();
+                          tokio::spawn(async move { direct_server(direct).await });
+                          std::thread::spawn(crate::lan::dachklinik_listen);
+                      }
+                      scrap::codec::test_av1();
+                      loop {
+                          if config::option2bool("stop-service", &Config::get_option("stop-service")) {
+                              server.write().unwrap().close_connections();
+                          }
+                          sleep(1.).await;
+                      }
+                  }
+          '''.rstrip())
+          after(mediator, r'if let Ok\(Ok\(\(stream, addr\)\)\) = hbb_common::timeout\(1000, l\.accept\(\)\)\.await \{',
+                '''
+                          if cfg!(windows) {
+                              let source = hbb_common::try_into_v4(addr);
+                              if !matches!(source.ip(), std::net::IpAddr::V4(ip)
+                                  if crate::lan::dachklinik_v12::other_lan_pc(&crate::lan::dachklinik_networks(), ip))
+                                  || config::option2bool("stop-service", &Config::get_option("stop-service"))
+                              {
+                                  continue;
+                              }
+                          }
+          '''.rstrip())
+          edit(mediator, r'(?m)^fn get_direct_port\(\) -> i32 \{', '''
+          fn get_direct_port() -> i32 {
+              if cfg!(windows) {
+                  return crate::lan::dachklinik_v12::SESSION_PORT.into();
+              }'''.lstrip())
+
+          # Fail before ID lookup, relay, WebSocket, proxy or DNS. The direct socket
+          # deliberately bypasses connect_tcp_local, which may honor a configured SOCKS proxy.
+          edit(client, r'(?m)^        if hbb_common::is_ip_str\(peer\) \{(?=\n[\s\S]{0,160}connect_tcp_local\(check_port\(peer, RELAY_PORT \+ 1\))',
+               '        if cfg!(windows) || hbb_common::is_ip_str(peer) {')
+          edit(client, r'connect_tcp_local\(check_port\(peer, RELAY_PORT \+ 1\), None, CONNECT_TIMEOUT\)\s*\.await\?,', '''
+                              if cfg!(windows) {
+                                  if !matches!(conn_type, ConnType::DEFAULT_CONN | ConnType::FILE_TRANSFER) {
+                                      bail!("DACHKLINIK LAN: use Remote Desktop or File Transfer.");
+                                  }
+                                  let Some(ip) = peer.trim().parse::<std::net::Ipv4Addr>().ok()
+                                      .filter(|ip| crate::lan::dachklinik_v12::other_lan_pc(&crate::lan::dachklinik_networks(), *ip))
+                                  else {
+                                      bail!("DACHKLINIK LAN V1.2: Ziel muss im selben lokalen Netzwerk sein.");
+                                  };
+                                  let endpoint = std::net::SocketAddr::from((ip, crate::lan::dachklinik_v12::SESSION_PORT));
+                                  let socket = timeout(
+                                      CONNECT_TIMEOUT,
+                                      hbb_common::tokio::net::TcpStream::connect(endpoint),
+                                  ).await??;
+                                  socket.set_nodelay(true).ok();
+                                  let local = socket.local_addr()?;
+                                  hbb_common::Stream::from(socket, local)
+                              } else {
+                                  connect_tcp_local(check_port(peer, RELAY_PORT + 1), None, CONNECT_TIMEOUT)
+                                      .await?
+                              },
+          '''.strip())
+
+          # Keep the built-in approval UI and permission checks. No login-screen exception.
+          # Only remote desktop and file transfer are in scope for this pilot.
+          after(connection, r'(?m)^    async fn on_message\(&mut self, msg: Message\) -> bool \{', '''
+                  if cfg!(windows)
+                      && matches!(msg.union.as_ref(), Some(message::Union::SwitchSidesResponse(_)))
+                  {
+                      return false;
+                  }
+          '''.rstrip())
+          after(connection, r'(?m)^        if let Some\(message::Union::LoginRequest\(lr\)\) = msg\.union \{', '''
+                      if cfg!(windows) {
+                          if !matches!(lr.union.as_ref(), None | Some(login_request::Union::FileTransfer(_))) {
+                              self.send_login_error("DACHKLINIK LAN: connection type not supported").await;
+                              return false;
+                          }
+                          if !lr.password.is_empty() || !lr.os_login.username.is_empty() || !lr.os_login.password.is_empty() {
+                              self.send_login_error("DACHKLINIK LAN V1.2.1: only local click approval is supported").await;
+                              return false;
+                          }
+                      }
+          '''.rstrip())
+          edit(connection, r'if \(password::approve_mode\(\) == ApproveMode::Click\s*&& !allow_logon_screen_password\)',
+               lambda m: 'if cfg!(windows) || (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)')
+
+          # Apply fixed settings to both the native runner and Flutter-loaded Rust library.
+          # The standard local "stop-service" and file/desktop permission choices remain available.
+          policy = '''
+                  config::OVERWRITE_SETTINGS.write().unwrap().extend(
+                      [
+                          ("direct-server", "Y"),
+                          ("direct-access-port", "21138"),
+                          ("approve-mode", "click"),
+                          ("allow-hide-cm", "N"),
+                          ("enable-tunnel", "N"),
+                          ("enable-terminal", "N"),
+                          ("enable-camera", "N"),
+                      ].into_iter().map(|(k, v)| (k.to_owned(), v.to_owned())),
+                  );
+                  config::OVERWRITE_LOCAL_SETTINGS.write().unwrap().insert(
+                      "enable-check-update".to_owned(), "N".to_owned(),
+                  );
+                  config::BUILTIN_SETTINGS.write().unwrap().extend(
+                      [
+                          ("allow-logon-screen-password", "N"),
+                          ("allow-remote-cm-modification", "N"),
+                          ("disable-installation", "Y"),
+                          ("disable-account", "Y"),
+                          ("disable-ab", "Y"),
+                          ("hide-network-settings", "Y"),
+                          ("register-device", "N"),
+                      ].into_iter().map(|(k, v)| (k.to_owned(), v.to_owned())),
+                  );
+          '''
+          after(common, r'(?m)^pub fn load_custom_client\(\) \{',
+                '\n    if cfg!(windows) {' + policy + '        return;\n    }')
+          after(common, r'(?m)^pub fn read_custom_client\(config: &str\) \{',
+                '\n    if cfg!(windows) {\n        load_custom_client();\n        return;\n    }')
+          for name in ('test_nat_type', 'test_rendezvous_server', 'check_software_update'):
+              after(common, rf'(?m)^pub fn {name}\(\) \{{',
+                    '\n    if cfg!(windows) {\n        return;\n    }')
+          after(common, r'(?m)^pub fn get_api_server\(api: String, custom: String\) -> String \{',
+                '\n    if cfg!(windows) {\n        return String::new();\n    }')
+          after(common, r'(?m)^pub async fn do_check_software_update\(\) -> (?:hbb_common::)?ResultType<\(\)> \{',
+                '\n    if cfg!(windows) {\n        return Ok(());\n    }')
+          for name in ('post_request_sync', 'http_request_sync'):
+              after(common, rf'(?m)^pub async fn {name}\([^{{}}]*?\) -> ResultType<String> \{{',
+                    '\n    if cfg!(windows) {\n        bail!("DACHKLINIK LAN: HTTP service disabled");\n    }')
+          after(ui, r'(?m)^pub fn test_if_valid_server\(host: String, test_with_proxy: bool\) -> String \{',
+                '\n    if cfg!(windows) {\n        return "DACHKLINIK LAN: server settings are disabled".to_owned();\n    }')
+
+          after(ui, r'(?m)^pub fn resolve_avatar_url\(avatar: String\) -> String \{',
+                '\n    if cfg!(windows) {\n        return String::new();\n    }')
+          updater = 'src/updater.rs'
+          after(updater, r'(?m)^pub fn manually_check_update\(\) -> ResultType<\(\)> \{',
+                '\n    if cfg!(windows) {\n        return Ok(());\n    }')
+
+          # V1.2: distinguish this pilot from previously extracted copies and stock clients.
+          lan = 'src/lan.rs'
+          after(lan, r'^type Message = RendezvousMessage;', '''
+          #[path = "dachklinik_discovery.rs"]
+          pub(crate) mod dachklinik_v12;
+
+          pub(crate) fn dachklinik_networks() -> Vec<dachklinik_v12::Network> {
+              let mut networks = Vec::new();
+              #[cfg(not(target_os = "ios"))]
+              for interface in default_net::get_interfaces() {
+                  for ip in interface.ipv4 {
+                      if let Some(net) = dachklinik_v12::Network::new(ip.addr, ip.netmask) {
+                          networks.push(net);
+                      }
+                  }
+              }
+              networks
+          }
+
+          pub(crate) fn dachklinik_listen() {
+              #[cfg(windows)]
+              {
+                  let hostname = whoami::hostname();
+                  let hostname = if hostname.trim().is_empty() { "Windows-PC" } else { &hostname };
+                  if let Err(err) = dachklinik_v12::listen(hostname, dachklinik_networks, || {
+                      config::option2bool("stop-service", &Config::get_option("stop-service"))
+                  }) {
+                      log::error!("DACHKLINIK LAN discovery: {err}");
+                  }
+              }
+          }
+          '''.rstrip())
+
+          # A discovery reply can be sent only while the real TCP listener is available.
+          # The same-subnet checks also apply to direct TCP and do not grant authorization.
+          edit(mediator, r'(?m)^(?P<i>\s*)listener = Some\(l\);', lambda m:
+               m[0] + '\n' + m['i'] + 'if cfg!(windows) { crate::lan::dachklinik_v12::set_accepting(true); }')
+          edit(mediator, r'(?m)^(?P<i>\s*)listener = None;(?=\s*continue;)', lambda m:
+               m[0] + '\n' + m['i'] + 'if cfg!(windows) { crate::lan::dachklinik_v12::set_accepting(false); }')
+
+          # The pinned 1.5.3 build includes upstream RequestApproval. Force the existing
+          # method for Windows sessions, including those opened outside the LAN panel.
+          after(client, r'^([ \t]*)self\.login_method\s*=\s*Default::default\(\);(?=\s*if !login_method\.is_empty\(\)\s*&&\s*!self\.set_login_method\(login_method\))',
+                '\n        let login_method = if cfg!(windows) { "request-approval" } else { login_method };')
+
+          # A peer that unexpectedly requests a password is incompatible with this
+          # pilot. Report the error and stop. Keep the native click-approval wait message.
+          edit(client, r'(?m)^    if err == LOGIN_MSG_PASSWORD_EMPTY \{', """
+              if cfg!(windows) && (err == LOGIN_MSG_PASSWORD_EMPTY || err == LOGIN_MSG_PASSWORD_WRONG) {
+                  interface.msgbox(
+                      "error",
+                      "Login Error",
+                      "DACHKLINIK LAN: Bitte auf beiden PCs dieselbe Version öffnen.",
+                      "",
+                  );
+                  return false;
+              }
+              if err == LOGIN_MSG_PASSWORD_EMPTY {""".lstrip('\n'))
+
+          # Use the short German label for the upstream approval status, including File Transfer.
+          edit('src/lang/de.rs',
+               r'(\("Please wait for the remote side to accept your session request\.\.\.",\s*)"[^"\n]*"(\))',
+               lambda m: m[1] + '"Warte auf Bestätigung"' + m[2])
+
+
+          after(ui, r"^pub fn get_lan_peers\(\) -> Vec<HashMap<&'static str, String>> \{", '''
+              #[cfg(windows)]
+              {
+                  use crate::lan::{dachklinik_networks, dachklinik_v12};
+                  static SCAN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+                  let Ok(_scan) = SCAN_LOCK.lock() else { return Vec::new() };
+                  let nonce = *uuid::Uuid::new_v4().as_bytes();
+                  return dachklinik_v12::scan(&dachklinik_networks(), nonce)
+                      .into_iter()
+                      .map(|(ip, name)| {
+                          HashMap::from([
+                              ("id", ip.to_string()),
+                              ("username", String::new()),
+                              ("hostname", name),
+                              ("platform", "Windows".to_owned()),
+                          ])
+                      })
+                      .collect();
+              }
+          '''.rstrip())
+
+          path = 'src/dachklinik_discovery.rs'
+          if Path(path).exists():
+              raise SystemExit(f'Unexpected existing LAN module: {path}')
+          changes[path] = Path('_DACHKLINIK_DISCOVERY_INPUT.rs').read_text(encoding='utf-8')
+
+          # Every transformation must match before any file is written.
+          for rel, body in changes.items():
+              Path(rel).write_text(body, encoding='utf-8', newline='\n')
+              print('LAN patch:', rel)
+          Path('_DACHKLINIK_LAN_SOURCE_LIST.txt').write_text('\n'.join(sorted(changes)) + '\n', encoding='utf-8')
+          PY_DACHKLINIK_LAN
+          while IFS= read -r file; do
+            mkdir -p "_DACHKLINIK_LAN_SOURCES/$(dirname "$file")"
+            cp "$file" "_DACHKLINIK_LAN_SOURCES/$file"
+          done < _DACHKLINIK_LAN_SOURCE_LIST.txt
+          git rev-parse HEAD > _DACHKLINIK_LAN_SOURCE_REVISION.txt
+          git -C libs/hbb_common rev-parse HEAD >> _DACHKLINIK_LAN_SOURCE_REVISION.txt
+          while IFS= read -r file; do
+            if [[ "$file" == src/dachklinik_discovery.rs ]]; then
+              rm -- "$file"
+            elif [[ "$file" == libs/hbb_common/* ]]; then
+              git -C libs/hbb_common restore -- "${file#libs/hbb_common/}"
+            else
+              git restore -- "$file"
+            fi
+          done < _DACHKLINIK_LAN_SOURCE_LIST.txt
+          git diff --exit-code HEAD -- .
+          git -C libs/hbb_common diff --exit-code HEAD -- .
+          grep -Fq 'State<ConnectionPage> createState() => _ConnectionPageState();' flutter/lib/desktop/pages/connection_page.dart
+          grep -Fq 'buildIDBoard(context)' flutter/lib/desktop/pages/desktop_home_page.dart
+          grep -Fq 'pub fn main_get_lan_peers() -> String' src/flutter_ffi.rs
+          grep -Fq 'LoginMethod::RequestApproval' src/client/login_method.rs
+          grep -Eq 'String[[:space:]]+loginMethod[[:space:]]*=' flutter/lib/common.dart
+
+      - name: Install bridge prerequisites
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates clang cmake curl gcc git g++ libclang-dev libgtk-3-dev llvm-dev nasm ninja-build pkg-config wget
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: '1.75'
+          targets: x86_64-unknown-linux-gnu
+          components: rustfmt
+
+      - name: Test LAN packet validation and local subnet rules
+        shell: bash
+        run: |
+          rustc --edition 2021 --test _DACHKLINIK_LAN_SOURCES/src/dachklinik_discovery.rs -o "$RUNNER_TEMP/dachklinik-lan-tests"
+          "$RUNNER_TEMP/dachklinik-lan-tests"
+          while IFS= read -r file; do
+            rustfmt --emit stdout --config skip_children=true --edition 2021 "_DACHKLINIK_LAN_SOURCES/$file" > /dev/null
+          done < _DACHKLINIK_LAN_SOURCE_LIST.txt
+
+      - name: Install Flutter for bridge codegen
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: stable
+          flutter-version: '3.22.3'
+          cache: true
+
+      - name: Install bridge generators and resolve Dart dependencies
+        shell: bash
+        run: |
+          cargo install cargo-expand --version "$CARGO_EXPAND_VERSION" --locked
+          cargo install flutter_rust_bridge_codegen --version "$FLUTTER_RUST_BRIDGE_VERSION" --features uuid --locked
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+          (cd flutter && flutter pub get)
+
+      - name: Generate bridge
+        shell: bash
+        run: |
+          "$HOME/.cargo/bin/flutter_rust_bridge_codegen" --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
+          cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+
+      - name: Upload bridge for the Windows job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dachklinik-v121-bridge
+          path: |
+            ./src/bridge_generated.rs
+            ./src/bridge_generated.io.rs
+            ./flutter/lib/generated_bridge.dart
+            ./flutter/lib/generated_bridge.freezed.dart
+            ./flutter/macos/Runner/bridge_generated.h
+            ./flutter/ios/Runner/bridge_generated.h
+            ./_DACHKLINIK_LAN_SOURCE_LIST.txt
+            ./_DACHKLINIK_LAN_SOURCE_REVISION.txt
+            ./_DACHKLINIK_LAN_SOURCES/
+          if-no-files-found: error
+          retention-days: 7
+
+  topmost:
+    name: Build Windows helper DLL (x64 only)
+    uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
+    with:
+      upload-artifact: true
+      target: windows-2022
+      configuration: Release
+      platform: x64
+      target_version: Windows10
+
+  windows-x64:
+    name: DACHKLINIK LAN V1.2.1 Windows x64 (unsigned pilot)
+    needs: [bridge, topmost]
+    runs-on: windows-2022
+    timeout-minutes: 360
+    env:
+      FLUTTER_VERSION: '3.24.5'
+      LLVM_VERSION: '15.0.6'
+      VCPKG_COMMIT_ID: '9e593bb18ea69cc5095e012465dcd675a822ed0d'
+      VCPKG_BINARY_SOURCES: 'clear;x-gha,readwrite'
+    steps:
+      - name: Initialize GitHub Actions cache environment
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Check out DACHKLINIK DESIGN V1.0 with submodules
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: dachklinik-v1.5.3
+          fetch-depth: 2
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Verify DACHKLINIK design revision
+        shell: pwsh
+        run: |
+          $revision = (git rev-parse HEAD).Trim()
+          if (-not $revision.StartsWith('9a24afc')) { throw "Wrong design revision: $revision" }
+          $base = (git rev-parse 'HEAD^').Trim()
+          if ($base -ne '95cca3f661f635b3cc85c04935fe8d96d8f432ef') { throw 'Unexpected base commit' }
+          $changed = @(git diff --name-only 'HEAD^' HEAD)
+          if ($changed.Count -ne 1 -or $changed[0] -ne 'flutter/lib/desktop/pages/desktop_home_page.dart') { throw 'Unexpected modified file(s)' }
+          $source = Get-Content -LiteralPath './flutter/lib/desktop/pages/desktop_home_page.dart' -Raw -Encoding UTF8
+          if (-not $source.Contains("'DACHKLINIK REMOTE'")) { throw 'DACHKLINIK design marker missing' }
+
+      - name: Download generated bridge
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dachklinik-v121-bridge
+          path: ./
+
+      - name: Apply verified LAN sources to the Windows checkout
+        shell: bash
+        run: |
+          {
+            git rev-parse HEAD
+            git -C libs/hbb_common rev-parse HEAD
+          } > _DACHKLINIK_LAN_WINDOWS_REVISION.txt
+          diff -u _DACHKLINIK_LAN_SOURCE_REVISION.txt _DACHKLINIK_LAN_WINDOWS_REVISION.txt
+          while IFS= read -r file; do
+            if [[ "$file" == src/dachklinik_discovery.rs ]]; then
+              test ! -e "$file"
+            else
+              test -f "$file"
+            fi
+            cp "_DACHKLINIK_LAN_SOURCES/$file" "$file"
+          done < _DACHKLINIK_LAN_SOURCE_LIST.txt
+          test -s _DACHKLINIK_LAN_SOURCE_LIST.txt
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
+        with:
+          version: '15.0.6'
+
+      - name: Install Flutter 3.24.5
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225 # v2.12.0
+        with:
+          channel: stable
+          flutter-version: '3.24.5'
+          architecture: x64
+
+      - name: Install RustDesk custom Flutter Windows engine
+        shell: pwsh
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri 'https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip' -OutFile 'windows-x64-release.zip'
+          Expand-Archive -Path 'windows-x64-release.zip' -DestinationPath 'windows-x64-release'
+          Move-Item -Force -Path 'windows-x64-release/*' -Destination 'C:/hostedtoolcache/windows/flutter/stable-3.24.5-x64/bin/cache/artifacts/engine/windows-x64-release/'
+
+      - name: Apply upstream Flutter dropdown compatibility patch
+        shell: bash
+        run: |
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff "$(dirname "$(dirname "$(which flutter)")")"
+          cd "$(dirname "$(dirname "$(which flutter)")")"
+          git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Install Rust 1.75 toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: '1.75'
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt
+
+      - name: Cache Rust compilation
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: windows-2022
+
+      - name: Set up vcpkg with GitHub Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: 9e593bb18ea69cc5095e012465dcd675a822ed0d
+          doNotCache: false
+
+      - name: Install native dependencies for x64
+        shell: bash
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        run: |
+          if ! "$VCPKG_ROOT/vcpkg" install --triplet x64-windows-static --x-install-root="$VCPKG_ROOT/installed"; then
+            find "$VCPKG_ROOT/" -name '*.log' -print | head -n 30
+            exit 1
+          fi
+
+      - name: Stage the LAN list interface
+        shell: bash
+        run: |
+          cat > _DACHKLINIK_PANEL_INPUT.dart <<'DACHKLINIK_PANEL_DART'
+          // DACHKLINIK REMOTE V1.2 - local discovery panel.
+          class DachklinikLocalBoard extends StatelessWidget {
+            const DachklinikLocalBoard({super.key, required this.settings});
+
+            final Widget settings;
+
+            @override
+            Widget build(BuildContext context) {
+              String hostname = 'Dieser PC';
+              try {
+                final name = dk_io.Platform.localHostname.trim();
+                if (name.isNotEmpty) hostname = name;
+              } catch (_) {}
+              return Padding(
+                padding: const EdgeInsets.fromLTRB(14, 4, 12, 12),
+                child: Row(
+                  children: [
+                    const Icon(Icons.computer_outlined, size: 20),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(hostname, maxLines: 1, overflow: TextOverflow.ellipsis),
+                          Text('LAN · V1.2.1', style: Theme.of(context).textTheme.bodySmall),
+                        ],
+                      ),
+                    ),
+                    settings,
+                  ],
+                ),
+              );
+            }
+          }
+
+          class _DachklinikLanState extends State<ConnectionPage> {
+            Timer? _timer;
+            bool _busy = false;
+            bool _loaded = false;
+            bool _unavailable = false;
+            Map<String, String> _peers = const {};
+
+            @override
+            void initState() {
+              super.initState();
+              _timer = Timer.periodic(const Duration(seconds: 5), (_) => _refresh());
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (mounted) _refresh();
+              });
+            }
+
+            @override
+            void dispose() {
+              _timer?.cancel();
+              super.dispose();
+            }
+
+            Future<void> _refresh() async {
+              if (!mounted || _busy) return;
+              _busy = true;
+              if (!_loaded) setState(() {});
+              Map<String, String> found = {};
+              bool failed = false;
+              try {
+                final response = jsonDecode(await bind.mainGetLanPeers());
+                if (response is! List) throw const FormatException('LAN');
+                for (final peer in response) {
+                  if (peer is! Map) continue;
+                  final ip = peer['id'];
+                  final name = peer['hostname'];
+                  if (ip is! String || name is! String || name.isEmpty) continue;
+                  final address = dk_io.InternetAddress.tryParse(ip);
+                  if (address == null || address.type != dk_io.InternetAddressType.IPv4) continue;
+                  found[address.address] = name;
+                }
+              } catch (_) {
+                failed = true;
+              } finally {
+                _busy = false;
+              }
+              if (!mounted) return;
+              if (!_loaded || failed != _unavailable || !dk_foundation.mapEquals(found, _peers)) {
+                setState(() {
+                  _loaded = true;
+                  _unavailable = failed;
+                  _peers = found;
+                });
+              }
+            }
+
+            void _open(String ip, {bool files = false}) {
+              if (!_peers.containsKey(ip)) return;
+              connect(context, ip, isFileTransfer: files, loginMethod: 'request-approval');
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final peers = _peers.entries.toList()
+                ..sort((a, b) {
+                  final byName = a.value.toLowerCase().compareTo(b.value.toLowerCase());
+                  return byName == 0 ? a.key.compareTo(b.key) : byName;
+                });
+              final names = <String, int>{};
+              for (final peer in peers) {
+                names.update(peer.value.toLowerCase(), (n) => n + 1, ifAbsent: () => 1);
+              }
+              final status = !_loaded
+                  ? 'Suche nach Rechnern …'
+                  : _unavailable
+                      ? 'Netzwerksuche fehlgeschlagen. Bitte aktualisieren.'
+                      : 'Noch kein Rechner gefunden. Öffne DACHKLINIK REMOTE V1.2.1 auf dem anderen PC im selben Netzwerk.';
+              return Padding(
+                padding: const EdgeInsets.fromLTRB(16, 20, 16, 12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text('Rechner im lokalen Netzwerk',
+                              style: Theme.of(context).textTheme.titleLarge),
+                        ),
+                        IconButton(
+                          onPressed: _refresh,
+                          tooltip: 'Aktualisieren',
+                          icon: const Icon(Icons.refresh),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    const Text('Eine Verbindung startet erst nach Bestätigung am anderen PC.'),
+                    const SizedBox(height: 12),
+                    if (peers.isEmpty)
+                      Expanded(child: Align(alignment: Alignment.topLeft, child: Text(status)))
+                    else
+                      Expanded(
+                        child: ListView.builder(
+                          itemCount: peers.length,
+                          itemBuilder: (_, index) {
+                            final peer = peers[index];
+                            final duplicate = (names[peer.value.toLowerCase()] ?? 0) > 1;
+                            return Card(
+                              key: ValueKey(peer.key),
+                              color: const Color(0xFF8EA4BD).withOpacity(0.22),
+                              elevation: 0,
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                child: Row(
+                                  children: [
+                                    const Icon(Icons.desktop_windows_outlined),
+                                    const SizedBox(width: 10),
+                                    Expanded(
+                                      child: Text(duplicate ? '${peer.value} (${peer.key})' : peer.value,
+                                          maxLines: 1, overflow: TextOverflow.ellipsis),
+                                    ),
+                                    FilledButton(
+                                      onPressed: () => _open(peer.key),
+                                      child: const Text('Verbinden'),
+                                    ),
+                                    IconButton(
+                                      tooltip: 'Dateien übertragen',
+                                      onPressed: () => _open(peer.key, files: true),
+                                      icon: const Icon(Icons.folder_copy_outlined),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                  ],
+                ),
+              );
+            }
+          }
+          DACHKLINIK_PANEL_DART
+
+      - name: Stage existing icon (1/4)
+        shell: bash
+        run: |
+          printf '%s' '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' > _DACHKLINIK_ICON.b64
+
+      - name: Stage existing icon (2/4)
+        shell: bash
+        run: |
+          printf '%s' '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' >> _DACHKLINIK_ICON.b64
+
+      - name: Stage existing icon (3/4)
+        shell: bash
+        run: |
+          printf '%s' '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' >> _DACHKLINIK_ICON.b64
+
+      - name: Stage existing icon (4/4)
+        shell: bash
+        run: |
+          printf '%s' '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' >> _DACHKLINIK_ICON.b64
+
+      - name: Apply DACHKLINIK V1.2.1 layout and branding
+        shell: bash
+        run: |
+          python3 - <<'PY_DACHKLINIK_V102'
+          from pathlib import Path
+          import base64, hashlib, shutil
+          
+          root = Path('.')
+          changed = Path("_DACHKLINIK_LAN_SOURCE_LIST.txt").read_text(encoding="utf-8").splitlines()
+          def edit(rel, old, new):
+              p = root / rel
+              s = p.read_text(encoding='utf-8-sig')
+              n = s.count(old)
+              if n != 1:
+                  raise SystemExit(f'SAFE STOP: {rel}: expected exactly one matching original text, found {n}')
+              updated = s.replace(old,new,1)
+              p.write_text(updated,encoding='utf-8',newline='\n')
+              changed.append(rel)
+          
+          home = 'flutter/lib/desktop/pages/desktop_home_page.dart'
+          old_title = "      const Padding(\n        padding: EdgeInsets.fromLTRB(20, 16, 16, 14),\n        child: Align(\n          alignment: Alignment.centerLeft,\n          child: Text(\n            'DACHKLINIK REMOTE',\n            style: TextStyle(\n              fontSize: 18,\n              fontWeight: FontWeight.w600,\n            ),\n          ),\n        ),\n      ),"
+          new_title = "      const Padding(\n        padding: EdgeInsets.fromLTRB(12, 16, 8, 10),\n        child: Align(\n          alignment: Alignment.centerLeft,\n          child: Text(\n            'DACHKLINIK REMOTE',\n            maxLines: 1,\n            softWrap: false,\n            overflow: TextOverflow.ellipsis,\n            style: TextStyle(\n              fontSize: 16,\n              fontWeight: FontWeight.w700,\n            ),\n          ),\n        ),\n      ),"
+          edit(home,old_title,new_title)
+          edit(home, 'buildIDBoard(context)', 'DachklinikLocalBoard(settings: buildPopupMenu(context))')
+          edit(home,'width: isIncomingOnly ? 280.0 : 200.0,','width: isIncomingOnly ? 280.0 : 234.0,')
+          
+          tab='flutter/lib/desktop/pages/desktop_tab_page.dart'
+          edit(tab,
+              '            body: DesktopTab(\n              controller: tabController,',
+              '            body: DesktopTab(\n              controller: tabController,\n              showLogo: false,')
+          
+          peer='flutter/lib/common/widgets/peer_card.dart'
+          edit(peer,
+              "            decoration: BoxDecoration(\n              color: str2color('${peer.id}${peer.platform}', 0x7f),\n              borderRadius: isPortrait",
+              "            decoration: BoxDecoration(\n              color: const Color(0xFF8EA4BD),\n              borderRadius: isPortrait")
+          edit(peer,
+              "                  child: Container(\n                    color: str2color('${peer.id}${peer.platform}', 0x7f),\n                    child: Row(",
+              "                  child: Container(\n                    color: const Color(0xFF8EA4BD),\n                    child: Row(")
+          
+          conn='flutter/lib/desktop/pages/connection_page.dart'
+          edit(conn,
+               'State<ConnectionPage> createState() => _ConnectionPageState();',
+               'State<ConnectionPage> createState() =>\n'
+               '      isWindows ? _DachklinikLanState() : _ConnectionPageState();')
+          panel_path = root / conn
+          panel_original = panel_path.read_text(encoding='utf-8')
+          panel_imports = (
+              "import 'dart:io' as dk_io;\n"
+              "import 'package:flutter/foundation.dart' as dk_foundation;\n"
+          )
+          panel_body = Path('_DACHKLINIK_PANEL_INPUT.dart').read_text(encoding='utf-8')
+          panel_path.write_text(panel_imports + panel_original + '\n' + panel_body,
+                                encoding='utf-8', newline='\n')
+
+          cmake='flutter/windows/CMakeLists.txt'
+          edit(cmake,'set(BINARY_NAME "rustdesk")','set(BINARY_NAME "DACHKLINIK_REMOTE")')
+          
+          rc='flutter/windows/runner/Runner.rc'
+          for a,b in [
+              ('VALUE "FileDescription", "RustDesk Remote Desktop"', 'VALUE "FileDescription", "DACHKLINIK REMOTE (RustDesk based)"'),
+              ('VALUE "InternalName", "rustdesk"','VALUE "InternalName", "DACHKLINIK_REMOTE"'),
+              ('VALUE "OriginalFilename", "rustdesk.exe"','VALUE "OriginalFilename", "DACHKLINIK_REMOTE.exe"'),
+              ('VALUE "ProductName", "RustDesk"','VALUE "ProductName", "DACHKLINIK REMOTE"'),
+          ]:
+              edit(rc,a,b)
+          # Preserve upstream legal copyright and AGPL notice in the resource.
+          
+          main='flutter/windows/runner/main.cpp'
+          edit(main,'  // Uri links dispatch','  // DACHKLINIK native window name.\n  app_name = L"DachklinikRemoteV12";\n  // Uri links dispatch')
+          
+          # Put exactly the same, deterministic icon in compiled exe AND Flutter window assets.
+          icon_data = base64.b64decode(Path('_DACHKLINIK_ICON.b64').read_bytes(), validate=True)
+          assert icon_data[:4] == b'\x00\x00\x01\x00'
+          for rel in ['flutter/windows/runner/resources/app_icon.ico','flutter/assets/icon.ico']:
+              p=root/rel
+              p.parent.mkdir(parents=True,exist_ok=True)
+              p.write_bytes(icon_data)
+              changed.append(rel)
+          
+          # Full changed files for the user, not just diff excerpts.  Source is also archived
+          # with runtime separately to honour the AGPL and allow audit.
+          manifest=[]
+          for rel in dict.fromkeys(changed):
+              path=root/rel
+              dst = Path('_DACHKLINIK_SOURCE_PATCH')/rel
+              dst.parent.mkdir(parents=True,exist_ok=True)
+              shutil.copy2(path,dst)
+              manifest.append(f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {rel}')
+          (Path('_DACHKLINIK_SOURCE_PATCH')/'SHA256.txt').write_text('\n'.join(manifest)+'\n',encoding='utf-8')
+          shutil.copy2('_DACHKLINIK_LAN_SOURCE_REVISION.txt', '_DACHKLINIK_SOURCE_PATCH/SOURCE_REVISIONS.txt')
+          (Path('_DACHKLINIK_SOURCE_PATCH')/'README.txt').write_text(
+            'DACHKLINIK REMOTE V1.2.1 LAN PILOT - COMPLETE MODIFIED FILES ONLY\n'
+            'From RustDesk 1.5.3 with existing DACHKLINIK DESIGN V1.0 patch.\n'
+            'UI-only footer and heading changes, top bar logo removal, neutral peer card color; native Windows binary name, icon, metadata.\n'
+            'Local broadcast discovery, same-subnet private IPv4, local click approval, no password or ID/relay fallback. Direct IP is unencrypted.\n'
+            'For app source and AGPL license, see mico2012/DACHKLINIK-REMOTE and upstream rustdesk/rustdesk.\n',
+            encoding='utf-8')
+          print('DACHKLINIK patch applied, source files:',len(manifest))
+          PY_DACHKLINIK_V102
+
+      - name: Build RustDesk Flutter x64 (portable folder, not installer)
+        shell: pwsh
+        run: |
+          python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec --vram
+          if ($LASTEXITCODE -ne 0) { throw "RustDesk build failed: $LASTEXITCODE" }
+          $release = 'flutter/build/windows/x64/runner/Release'
+          if (-not (Test-Path -LiteralPath "$release/DACHKLINIK_REMOTE.exe")) { throw "Missing: $release/DACHKLINIK_REMOTE.exe" }
+          Move-Item -LiteralPath $release -Destination 'dachklinik_remote'
+
+      - name: Include RustDesk Windows helper DLL
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: topmostwindow-artifacts-x64
+          path: ./dachklinik_remote
+
+      - name: Check Windows outputs and write pilot notes
+        shell: pwsh
+        run: |
+          if (-not (Test-Path './dachklinik_remote/DACHKLINIK_REMOTE.exe')) { throw 'DACHKLINIK_REMOTE.exe not found' }
+          if (-not (Test-Path './dachklinik_remote/flutter_windows.dll')) { throw 'Flutter Windows runtime not found' }
+          if (-not (Test-Path './dachklinik_remote/librustdesk.dll')) { throw 'RustDesk library not found' }
+          $core = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Resolve-Path './dachklinik_remote/librustdesk.dll').Path))
+          if (-not $core.Contains('DACHKLINIK LAN V1.2.1: only local click approval is supported')) { throw 'The compiled library is not the V1.2 LAN core' }
+          Remove-Variable core
+          (Get-FileHash './dachklinik_remote/DACHKLINIK_REMOTE.exe' -Algorithm SHA256).Hash | Set-Content './dachklinik_remote/EXE_SHA256.txt'
+          Copy-Item -LiteralPath './LICENCE' -Destination './dachklinik_remote/LICENCE'
+          @'
+          DACHKLINIK REMOTE V1.2.1 AUTOMATIC LAN AND CLICK APPROVAL - WINDOWS X64 PILOT
+          Keep DACHKLINIK_REMOTE.exe, all DLLs, and the data folder together.
+          Quit older Dachklinik or RustDesk copies on both PCs before the test.
+          Run V1.2.1 on both authorized Windows PCs on the same private IPv4 test subnet.
+          The V1.2.1 label is shown next to your computer name on the main screen.
+          Select Verbinden for desktop or the folder icon for File Transfer.
+          The other PC must click Akzeptieren. The requesting PC waits for approval.
+          First deny a request, then retry and accept. No password dialog should appear.
+          Quit the receiving app and confirm its entry disappears after refresh.
+          Test file transfer with a dummy file. TCP 21138 and UDP 21139 are local only.
+          If Windows requests firewall permission, allow only the private test network.
+          Do not use public profile rules or forward these ports on the router.
+          This is an unsigned pilot. Smart App Control may still block execution.
+          This pilot uses RustDesk Direct IP, which does not encrypt the session.
+          Use a separate offline test LAN and do not open real business files.
+          No source files are changed in the repository and no release is published.
+          '@ | Set-Content './dachklinik_remote/LAN_TEST_README.txt'
+
+      - name: Upload DACHKLINIK LAN V1.2.1 Windows x64
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: DACHKLINIK-REMOTE-V1.2.1-LAN-WINDOWS-X64-PILOT
+          path: ./dachklinik_remote/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload complete modified source files (AGPL source patch)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: DACHKLINIK-REMOTE-V1.2.1-LAN-COMPLETE-CHANGED-SOURCE
+          path: ./_DACHKLINIK_SOURCE_PATCH/
+          if-no-files-found: error
+          retention-days: 7
